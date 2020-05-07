@@ -370,7 +370,7 @@ modules=python3,impi       ; the list of TACC modules to load
     f.write(iniString)
 
 def parseArgs():
-    parser = argparse.ArgumentParser(description='Parametric Launcher')
+    parser = argparse.ArgumentParser(description='Parametric Sweeper')
     parser.add_argument("configFile", help="run a slurm parameter sweep from this configuraion file")
     parser.add_argument('--server',  action="store_true",
                    help='run the server (not to be run by users but by SLURM')
