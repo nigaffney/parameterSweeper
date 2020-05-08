@@ -41,19 +41,41 @@ dbFileName=None
 taskLevel=0
 maxTaskLevel=1
 
+# this takes the list of tasks and, if no tasks are already in the 
+# database, put stores them there
+
+# need to add timestamping and such on transitions
+
+# if the db file exists, it resets any RUNNING tasks to INIT
+# state so they will run again.  
+
+# at some point we might want to cleanup those directories of the 
+# RUNNING tasks and check to see if there are new TASKS in the tasklist
+# and append them but this is the first go
+
+# tasks is a dictionary of each expanded command listed
+# by their order in the original list e.g. command=x,y
+# will be key 0 value [x] and key 1 value [y] where the 
+# arrays are the full list of commands to be run with all
+# parameters expanded
+ 
 def createTaskList(tasks):
     global dbFileName
+    db = sqlite3.connect(dbFileName)
+
+    c = db.cursor()
+
+    # if db file exists, reset the RUNNING to INIT
+
     if os.path.exists(dbFileName):
         sqlCmd = 'UPDATE tasks where status = "RUNNING" set status = "INIT"'
-        db = sqlite3.connect(dbFileName)
-    
-        c = db.cursor()
+
+
         c.execute(sqlCmd)
          
         return
-    db = sqlite3.connect(dbFileName)
-    
-    c = db.cursor()
+
+    #otherwise start adding tasks to the table.      
     taskId=0
     c.execute("CREATE TABLE tasks (taskId integer, taskOrder integer, cmd text, status text, host text, startTime text, endTime text, lastUpdate text)")
     for key in tasks.keys():
@@ -64,17 +86,19 @@ def createTaskList(tasks):
     db.commit()
     db.close()
 
+
+# simply prints out the rows of all tasks including status
+
 def getTaskList(dbFileName):
     db=sqlite3.connect(dbFileName)
     c=db.cursor()
     for row in c.execute("select * from tasks ORDER BY taskOrder"):
         print(row)
-def taskRunner():
-    mainRunner = threading.Thread(target=taskRunner)
-    mainRunner.start()
-    return
 
 
+# this is the main thread that monitors task states
+# and starts new ones.  It returns when there are no more 
+# tasks in the INIT state
 def runTasks():
     global dbFileName
     global taskLevel
@@ -119,12 +143,19 @@ def runTasks():
         raise
 
 
+# this is the function that runs a task.  It does a bruit force
+# ssh to the node given in threadname (where threadname is the
+# merger of the nth task on a node and the node name colon separated
+# but in this backwards order so we distribute evenly across nodes
+# rather than fill up one node and then the next)
 
 def startTask(cmd, threadname):
     global fatalError
     global dbFileName
     logRunning(cmd,threadname)
     try:
+        # get rid of characters that will make our lives painful in driectory names
+        # and use that name as the directory in which that specific command will run
         fname=cmd.replace(' ','_')
         fname=fname.replace('"','')
         fname=fname.replace('\'','')
@@ -137,6 +168,8 @@ def startTask(cmd, threadname):
         if not os.path.isdir(fname):
             os.mkdir(fname)
         cwd=os.getcwd() + '/' + fname
+        # so send stdout and stderr to files in the tasks directory and run the 
+        # task in that directory by brute force 
         hostname=threadname.split(':')[1]
         stdoutFile =  cwd+'/output'
         stderrFile= cwd+'/errors'
@@ -144,14 +177,23 @@ def startTask(cmd, threadname):
   
          
         status=subprocess.run(sshcmd.split(' '),capture_output=False)
+
+        # log exit
         exitCode=status.returncode 
         logTaskCompletion(exitCode, cmd, threadname)
     except:
+        # if something goes wrong with this...something bad happened so throw on the breaks
+        # with the fatalError flag 
+        # so we dont start any new tasks
+
         print("Unexpected error:", sys.exc_info()[0])
         logTaskCompletion(1,cmd,threadname)
         fatalError=True
         raise
 
+
+# logs a task as running on a specific threadname location (thnead number : hostname)
+# and pull the thread out of the available pool
 def logRunning(cmd,threadname):
     global dbFileName
     print('Starting task ' + cmd)
@@ -165,6 +207,7 @@ def logRunning(cmd,threadname):
     db.close()
 
 
+# log a completed task and put that thread back into the available pool
 def logTaskCompletion(exitCode, command, threadname):
     global dbFileName
     db = sqlite3.connect(dbFileName)
@@ -186,15 +229,16 @@ def logTaskCompletion(exitCode, command, threadname):
     db.commit()
     db.close()
 
-    # call startJob to start next job
 
-
+# this is the parameter expander.  for each parameter and command it expands 
+# the list of tasks to run into a larger list
 
 def expandParam(baseCommands,tag,values):
     list = {}
     # need to expand file and range parameters here
     newvals=[]
     for value in values:
+        # see if this is values in a file
         if value.startswith('<') and value.endswith('>'):
            newvals.remove(value)
            filename = value[1:-1]
@@ -205,6 +249,7 @@ def expandParam(baseCommands,tag,values):
                sys.exit(1)
            for val in fileValues:
                newvals.append(val)
+        # or values in a range
         elif value.startswith('[') and value.endswith(']'):
            newvals.remove(value)
            rangeString=value[1:-1]
@@ -215,6 +260,7 @@ def expandParam(baseCommands,tag,values):
            fstart=None
            fend=None
            fstep=None
+           # basic error checking
            try:
                fstart=float(start)
            except:
@@ -242,6 +288,7 @@ def expandParam(baseCommands,tag,values):
                while fv <= fend:
                    newvals.append(fv)
                    fv=fv+fstep
+        # or just single values.  Note you can mix and match file, ranges, and single values
         else:
            newvals.append(value) 
    
@@ -255,6 +302,8 @@ def expandParam(baseCommands,tag,values):
                     list[key].append(expandedString)
     return list
 
+
+# loads and checks the validity of the ini file
 def loadIni(configFile):
     global maxTaskLevel
     cmd={}
@@ -295,10 +344,8 @@ def loadIni(configFile):
 
 
 
-jobStartLock = False
-
-
-
+# create and submits the simple slurm script that loads the modules
+# and runs this script in --server mode
 
 def submitSlurmJob(jobname,account, queueName, ntasks, nnodes, jobTime, modules):
     slurmScript="""#!/bin/bash
@@ -348,6 +395,8 @@ def submitSlurmJob(jobname,account, queueName, ntasks, nnodes, jobTime, modules)
     os.exec("sbatch " + slurmScript)
     return
 
+
+# this writes the exemplar ini file
 def writeConfig(fname):
 
     iniString="""[sweep info]
@@ -369,6 +418,7 @@ modules=python3,impi       ; the list of TACC modules to load
     f=open(fname,'w')
     f.write(iniString)
 
+# parse the command line args
 def parseArgs():
     parser = argparse.ArgumentParser(description='Parametric Sweeper')
     parser.add_argument("configFile", help="run a slurm parameter sweep from this configuraion file")
@@ -382,6 +432,10 @@ def parseArgs():
                    help='write a new config file')
     return parser.parse_args()
 
+# calls to scontrol to get the list of nodes 
+# and then creates tasks based on the tasks per node
+# in the ini file.  This creates the task db
+# used to start and monitor state of threads
 def getNodeList(tasksPerNode):
     global dbFileName
     snl=os.getenv('SLURM_NODELIST')
@@ -405,10 +459,20 @@ def getNodeList(tasksPerNode):
     db.commit()
     db.close()
 
+
+# the main...
 def main():
     global dbFileName
     args=parseArgs()
-
+    configFile = args.configFile
+    cfgFile=configFile
+    jobName=configFile
+    # add .ini to the config file name if its not there
+    # and remove it from the name of this job if it is
+    if not configFile.endswith('.ini'):
+        cfgFile=configFile+'.ini'
+    else
+        jobName=jobName[:-4]
     # ok have a switch here so if run by default it loads
     # the ini file and creates the slurm job to submit
     # to the cluster
@@ -417,13 +481,13 @@ def main():
     # from the slurm job which then checks the DB...loads or
     # initializes state and then starts running jobs
     if args.writeConfig:
-        writeConfig(args.configFile)
+        writeConfig(cfgFile)
         sys.exit(0)
-    dbFileName = os.getcwd()+'/'+args.configFile+'.sqllite'
+    dbFileName = os.getcwd()+'/'+jobName+'.sqllite'
     if args.reset:
         print("Resetting everything...")
         os.remove(dbFileName)
-    tasks,cfg=loadIni(args.configFile)
+    tasks,cfg=loadIni(cfgFile)
     createTaskList(tasks)
     if args.server:
         getNodeList(cfg["num_tasks_per_node"])
@@ -432,7 +496,7 @@ def main():
         getTaskList()
     else:
         # need to check validity of values here....all in good time
-        submitSlurmJob(args.configFile, cfg['allocation'], cfg['queue_name'], 
+        submitSlurmJob(jobName, cfg['allocation'], cfg['queue_name'], 
 		cfg['num_tasks_per_node'], cfg['num_nodes'], cfg['job_time'], cfg['modules'])
 
 
